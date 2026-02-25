@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# capsule-netns-up — create a network namespace and bring up a WireGuard VPN inside it
+#
+# Usage: capsule-netns-up <nsname> <wgconfig>
+#
+# The WireGuard interface is created directly inside the namespace, never in
+# the root namespace, so there is no window during which traffic can leak.
+#
+# DNS servers from the config's DNS = field are written to
+# /etc/netns/<nsname>/resolv.conf.  `ip netns exec` bind-mounts this file
+# over /etc/resolv.conf automatically.  For capsule (which enters only the
+# network namespace), DNS traffic is still VPN-routed as long as the DNS
+# server is a non-loopback address — but if the system uses a local stub
+# resolver (127.0.0.53, 127.0.0.1) that resolver will be unreachable inside
+# the namespace; see the README for the workaround.
+
+set -euo pipefail
+
+PROG=$(basename "$0")
+
+usage() { printf 'usage: %s <nsname> <wgconfig>\n' "$PROG" >&2; exit 1; }
+die()   { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+log()   { printf '%s: %s\n' "$PROG" "$*"; }
+
+[[ $# -eq 2 ]] || usage
+
+NSNAME="$1"
+WGCONF="$2"
+
+# ── pre-flight ────────────────────────────────────────────────────────────────
+
+[[ $EUID -eq 0 ]] || die "must be run as root"
+[[ -f "$WGCONF" ]] || die "wireguard config not found: $WGCONF"
+
+command -v ip >/dev/null 2>&1 || die "ip not found (install iproute2)"
+command -v wg >/dev/null 2>&1 || die "wg not found (install wireguard-tools)"
+
+# Warn if the config file has group or world read bits (private key risk).
+if (( 8#$(stat -c '%a' "$WGCONF") & 8#044 )); then
+    printf '%s: warning: %s is group/world-readable — consider chmod 600\n' \
+        "$PROG" "$WGCONF" >&2
+fi
+
+# ── idempotency ───────────────────────────────────────────────────────────────
+
+if [[ -e "/var/run/netns/$NSNAME" ]]; then
+    log "namespace '$NSNAME' already exists, nothing to do"
+    exit 0
+fi
+
+# ── parse [Interface] section ─────────────────────────────────────────────────
+#
+# Extract a single field value from the [Interface] section of a wg config.
+# Handles: leading/trailing whitespace, inline comments.
+
+iface_field() {
+    awk -v key="$1" '
+        /^\[Interface\]/          { in_iface=1; next }
+        /^\[[A-Za-z0-9]+\]/       { in_iface=0; next }
+        !in_iface                 { next }
+        /^[[:space:]]*#/          { next }
+        match($0, "^[[:space:]]*" key "[[:space:]]*=") {
+            val = substr($0, RSTART + RLENGTH)
+            sub(/^[[:space:]]+/, "", val)
+            sub(/[[:space:]]*#.*$/, "", val)
+            sub(/[[:space:]]+$/, "", val)
+            print val
+            exit
+        }
+    ' "$WGCONF"
+}
+
+WG_ADDRESS=$(iface_field "Address")
+WG_DNS=$(iface_field "DNS")
+
+[[ -n "$WG_ADDRESS" ]] || die "no Address field found in $WGCONF"
+
+# ── strip wg-quick-only fields ────────────────────────────────────────────────
+#
+# wg-setconf only understands PrivateKey, ListenPort, DNS (peers), etc.
+# Fields like Address, DNS, MTU, Table, and the Pre/Post Up/Down hooks are
+# wg-quick extensions that cause wg setconf to error.
+
+TMPCONF=$(mktemp /tmp/capsule-wg.XXXXXX)
+chmod 600 "$TMPCONF"
+
+# WGIF holds the temporary interface name while it is in the default namespace.
+# The cleanup function deletes it if we exit before successfully moving it.
+WGIF=""
+cleanup() {
+    [[ -n "$WGIF" ]] && ip link del "$WGIF" 2>/dev/null || true
+    rm -f "$TMPCONF"
+}
+trap cleanup EXIT
+
+grep -vE '^\s*(Address|DNS|MTU|Table|SaveConfig|PreUp|PostUp|PreDown|PostDown)\s*=' \
+    "$WGCONF" > "$TMPCONF"
+
+# ── build namespace ───────────────────────────────────────────────────────────
+
+log "creating namespace '$NSNAME'"
+ip netns add "$NSNAME"
+
+# WireGuard namespace model
+# ─────────────────────────
+# A WireGuard interface has two distinct layers:
+#
+#   1. The virtual wg0 interface — where decrypted traffic appears.
+#   2. The UDP socket — how WireGuard sends/receives encrypted packets to/from
+#      the VPN peer over the real internet.
+#
+# The WireGuard kernel module binds the UDP socket to whichever network
+# namespace the interface is in AT THE TIME wg setconf (or UAPI key exchange)
+# is called.  After the interface is moved to another namespace, the socket
+# stays in the original one.
+#
+# We exploit this to get the desired topology:
+#
+#   default namespace:  UDP socket → real internet → VPN peer
+#   VPN namespace:      wg0 → decrypted traffic → apps via capsule
+#
+# Sequence:
+#   1. Create wg0 in the DEFAULT namespace (temporary name to avoid conflicts).
+#   2. wg setconf in the DEFAULT namespace → UDP socket bound here.
+#   3. ip link set ... netns → move wg0 to the VPN namespace.
+#      The UDP socket stays in the default namespace.
+#   4. Configure address, routes, bring up — all inside the VPN namespace.
+
+WGIF="wg-${NSNAME}-$$"
+ip link add "$WGIF" type wireguard || die "failed to create WireGuard interface '$WGIF'"
+
+# Configure keys and peers while in the default namespace.
+# This is the step that anchors the UDP transport socket here.
+wg setconf "$WGIF" "$TMPCONF" || die "wg setconf failed"
+
+# Move the interface into the namespace and rename it to wg0.
+# The encrypted UDP socket remains in the default namespace — intentional.
+ip link set "$WGIF" netns "$NSNAME" name wg0
+WGIF=""  # now owned by the namespace; nothing to clean up in default ns
+
+# Assign address(es).  The Address field may contain multiple comma-separated
+# values, e.g. "10.0.0.2/24, fd00::2/128" for dual-stack tunnels.
+has_ipv6=false
+IFS=',' read -ra ADDRS <<< "$WG_ADDRESS"
+for addr in "${ADDRS[@]}"; do
+    addr="${addr//[[:space:]]/}"
+    ip -n "$NSNAME" addr add "$addr" dev wg0
+    [[ "$addr" == *:* ]] && has_ipv6=true
+done
+
+# Bring up the interface and loopback.
+ip -n "$NSNAME" link set wg0 up
+ip -n "$NSNAME" link set lo  up
+
+# Default route(s) — all traffic goes through the VPN.
+ip -n "$NSNAME" route add default dev wg0
+$has_ipv6 && ip -n "$NSNAME" -6 route add default dev wg0
+
+# ── namespace file permissions ────────────────────────────────────────────────
+#
+# ip netns add creates /var/run/netns/<nsname> as a bind mount of an nsfs
+# inode.  nsfs does not implement setattr, so chmod/chown return EPERM even
+# for root.  The file stays mode 000.
+#
+# capsule is therefore installed with cap_dac_read_search+ep, which allows it
+# to open the mode-000 file directly.  That capability is dropped along with
+# all others before exec, so the child process has none.
+
+# ── DNS isolation ─────────────────────────────────────────────────────────────
+#
+# Write resolv.conf to /etc/netns/<nsname>/resolv.conf.
+# iproute2's `ip netns exec` bind-mounts this file over /etc/resolv.conf
+# so that processes see VPN-provided DNS servers.
+# capsule enters only the network namespace (not the mount namespace), so
+# this file is not bind-mounted automatically — but DNS traffic is still
+# routed through the VPN tunnel.  If the system resolv.conf points to a
+# local stub resolver, see the README for DNS configuration options.
+
+if [[ -n "$WG_DNS" ]]; then
+    install -d /etc/netns/"$NSNAME"
+    {
+        printf '# Generated by %s for namespace %s\n' "$PROG" "$NSNAME"
+        IFS=',' read -ra DNS_SERVERS <<< "$WG_DNS"
+        for srv in "${DNS_SERVERS[@]}"; do
+            srv="${srv//[[:space:]]/}"
+            [[ -n "$srv" ]] && printf 'nameserver %s\n' "$srv"
+        done
+    } > /etc/netns/"$NSNAME"/resolv.conf
+    log "wrote DNS to /etc/netns/$NSNAME/resolv.conf"
+else
+    printf '%s: warning: no DNS = field in %s — DNS not isolated\n' \
+        "$PROG" "$WGCONF" >&2
+fi
+
+log "namespace '$NSNAME' is up (wg0 via $(wg show wg0 endpoints 2>/dev/null | awk '{print $2}' | head -1 || echo '?'))"

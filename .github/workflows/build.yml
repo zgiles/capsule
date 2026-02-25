@@ -1,0 +1,23 @@
+name: build
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get install -y libcap-dev
+
+      - name: Build
+        run: make
+
+      - name: Verify binary exists
+        run: test -x ./capsule

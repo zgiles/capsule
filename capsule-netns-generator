@@ -1,0 +1,46 @@
+#!/bin/sh
+# capsule-netns-generator — systemd unit generator for capsule namespaces
+#
+# Installed to: /usr/local/lib/systemd/system-generators/
+# See: systemd.generator(7)
+#
+# systemd calls generators with three directory arguments before starting
+# units.  This generator creates wants-symlinks so that a
+# capsule-netns@<name>.service instance is automatically pulled in by
+# capsule-namespaces.target for every /etc/capsule/<name>.conf file.
+#
+# Workflow:
+#   1. sudo systemctl enable capsule-namespaces.target   (once)
+#   2. sudo install -m600 myvpn.conf /etc/capsule/
+#   3. sudo systemctl daemon-reload
+#   4. sudo systemctl start capsule-netns@myvpn
+#      (or reboot — it starts automatically from then on)
+
+set -eu
+
+NORMAL_DIR="${1:-/run/systemd/generator}"
+CONF_DIR="/etc/capsule"
+TARGET="capsule-namespaces.target"
+SERVICE_TEMPLATE="/etc/systemd/system/capsule-netns@.service"
+
+# Nothing to do if there are no configs yet.
+[ -d "$CONF_DIR" ] || exit 0
+
+for conf in "$CONF_DIR"/*.conf; do
+    # The glob expands literally if there are no matches — skip it.
+    [ -f "$conf" ] || continue
+
+    name="${conf##*/}"   # basename
+    name="${name%.conf}" # strip extension
+
+    # Reject empty names or names with characters that are unsafe in unit
+    # names (path separators, shell metacharacters, whitespace).
+    case "$name" in
+        "" | *[!A-Za-z0-9_.+-]*) continue ;;
+    esac
+
+    wants_dir="$NORMAL_DIR/${TARGET}.wants"
+    mkdir -p "$wants_dir"
+    ln -sf "$SERVICE_TEMPLATE" \
+        "$wants_dir/capsule-netns@${name}.service"
+done

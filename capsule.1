@@ -1,0 +1,378 @@
+.TH CAPSULE 1 "2026-02-24" "capsule" "User Commands"
+.
+.SH NAME
+capsule \- execute a command inside a Linux network namespace
+.
+.SH SYNOPSIS
+.B capsule
+.I netns
+.I command
+.RI [ args \&.\|.\|.]
+.br
+.B capsule list
+.RB [ \-v ]
+.br
+.B capsule status
+.RB [ \-v ]
+.I netns
+.
+.SH DESCRIPTION
+.B capsule
+enters the network namespace identified by
+.I netns
+and executes
+.I command
+inside it.
+It is designed to be installed with the
+.B cap_sys_admin,cap_dac_read_search+ep
+file capability (via
+.BR setcap (8))
+rather than as a setuid-root binary.
+.PP
+The sequence of operations is:
+.IP 1. 3
+Verify the caller is not root (UID\~0).
+.IP 2.
+Open
+.I netns
+and verify via
+.BR fstatfs (2)
+that it is a network namespace
+.RB ( NSFS_MAGIC ).
+.IP 3.
+If
+.IR /etc/netns/ name /resolv.conf
+exists, create a private mount namespace and bind-mount it over
+.IR /etc/resolv.conf
+for DNS isolation.
+.IP 4.
+Call
+.BR setns (2)
+with
+.B CLONE_NEWNET
+to enter the namespace.
+.IP 5.
+Drop all capabilities (effective, permitted, inheritable, ambient) using
+.BR libcap (3),
+leaving the process fully unprivileged.
+.IP 6.
+Drop
+.B cap_sys_admin
+and
+.B cap_dac_read_search
+from the capability bounding set via
+.BR prctl (2)
+.BR PR_CAPBSET_DROP ,
+preventing child processes from re-acquiring these capabilities through a
+setcap binary.
+.IP 7.
+.BR execvp (3)
+the requested command with the original UID/GID and the unmodified
+environment.
+.PP
+Because
+.B execvp
+replaces the
+.B capsule
+process, the child's exit status is propagated directly to the caller.
+.
+.SH SUBCOMMANDS
+.TP
+.B list
+List all named network namespaces found in
+.IR /var/run/netns .
+With
+.BR \-v ,
+also display the processes running inside each namespace.
+Prints a message if the directory does not exist or is empty.
+.
+.TP
+.B status
+Show the network interfaces and running processes for a single namespace.
+The
+.I netns
+argument accepts the same short name or full path as the exec form.
+.B \-v
+is accepted and reserved; status always shows full detail.
+.
+.SH OPTIONS
+.TP
+.I netns
+Either a short namespace name or a full path.
+If the argument contains no
+.RB ' / ',
+capsule constructs
+.IR /var/run/netns/<name>
+and uses that path.
+Full paths (anything containing
+.RB ' / ')
+are used directly without modification, so
+.IR /var/run/netns/vpn ,
+.IR /proc/<pid>/ns/net ,
+and similar paths all work as-is.
+.
+.TP
+.I command
+Name or path of the program to execute.
+Searched via
+.B PATH
+if not an absolute path.
+.
+.TP
+.RI [ args ]
+Zero or more arguments forwarded verbatim to
+.IR command .
+.
+.TP
+.B \-v
+Verbose mode.
+For
+.BR list :
+show processes per namespace.
+Accepted (and reserved) for
+.BR status ,
+which always shows full detail.
+.
+.SH EXIT STATUS
+.B capsule
+itself exits with status\~1 on any error before exec.
+On success the exec form never returns — it becomes
+.IR command ,
+whose exit status is therefore the exit status seen by the caller.
+The
+.B list
+and
+.B status
+subcommands exit 0 on success and 1 on error.
+.
+.SH ERRORS
+Error messages are written to standard error with the prefix
+.BR "capsule: " .
+.
+.TP
+.B refusing to run as root (UID 0)
+capsule was invoked by the root user.  Use
+.BR "ip netns exec" (8)
+or
+.BR nsenter (1)
+instead.
+.
+.TP
+.IB netns-path ": No such file or directory"
+The namespace file does not exist.
+.
+.TP
+.IB netns-path ": not a network namespace"
+The path exists but is not a namespace file
+.RB ( fstatfs
+did not return
+.BR NSFS_MAGIC ).
+.
+.TP
+.B setns(CLONE_NEWNET): \fR...
+.BR setns (2)
+failed.  Common causes: the file capability is missing
+.RB ( cap_sys_admin
+not set on the binary), or the namespace file is not readable.
+.
+.TP
+.B cap_set_proc: failed to drop capabilities
+.BR libcap (3)
+could not clear the capability sets.
+.
+.TP
+.IB command ": No such file or directory"
+.I command
+was not found on
+.BR PATH .
+.
+.SH SECURITY
+.SS File capabilities vs. setuid
+capsule is installed with
+.BR "setcap 'cap_sys_admin,cap_dac_read_search+ep'" ,
+not as a setuid-root binary.  Two capabilities are used:
+.TP
+.B cap_dac_read_search
+Open the network namespace file.
+.BR "ip netns add" (8)
+creates namespace files as bind mounts of nsfs inodes.
+nsfs does not implement
+.IR setattr ,
+so
+.BR chmod (1)
+returns
+.B EPERM
+even for root — the files remain mode 000.
+.B cap_dac_read_search
+allows capsule to open them directly.
+.TP
+.B cap_sys_admin
+Call
+.BR setns (2)
+to enter the network namespace.
+.PP
+Both capabilities are active only for the duration of the
+.B capsule
+process itself.  The child (after
+.BR exec )
+holds
+.B no
+capabilities.
+.
+.SS Capability drop
+After
+.BR setns ,
+capsule calls
+.BR cap_set_proc (3)
+with an empty capability set, clearing the effective, permitted, and
+inheritable sets.  Ambient capabilities are cleared via
+.BR prctl (2)
+.BR PR_CAP_AMBIENT_CLEAR_ALL .
+The child therefore starts with the same privilege as any ordinary process
+run directly by the user.
+.PP
+In addition, capsule drops
+.B cap_sys_admin
+and
+.B cap_dac_read_search
+from the capability bounding set via
+.BR prctl (2)
+.BR PR_CAPBSET_DROP .
+Even though the effective/permitted/inheritable sets are already empty,
+removing these from the bounding set prevents a child process that executes
+a copy of capsule (or any other binary carrying the same file capabilities)
+from re-acquiring
+.B cap_sys_admin
+or
+.B cap_dac_read_search
+and escaping the network namespace.
+.
+.SS Namespace file permissions
+.B capsule
+does not modify namespace file permissions.  The administrator is
+responsible for granting read access to the namespace file
+.RI ( chmod / chgrp )
+for the users who should be allowed to enter it.  This is the access
+control mechanism: if a user cannot open the file, they cannot enter the
+namespace.
+.
+.SH FILES
+.TP
+.I /var/run/netns/\fIname\fR
+Conventional location for named network namespaces, managed by
+.BR ip-netns (8).
+.
+.TP
+.I /proc/\fIpid\fR/ns/net
+Per-process network namespace file, readable if the caller has permission
+to inspect the target process.
+.
+.SH EXAMPLES
+Run Firefox inside a namespace named
+.IR vpn
+using the short name:
+.PP
+.RS
+.EX
+capsule vpn firefox
+.EE
+.RE
+.
+.PP
+Same using an explicit path:
+.PP
+.RS
+.EX
+capsule /var/run/netns/vpn firefox
+.EE
+.RE
+.
+.PP
+Open an interactive shell for debugging:
+.PP
+.RS
+.EX
+capsule vpn bash
+.EE
+.RE
+.
+.PP
+Check which external IP address is visible:
+.PP
+.RS
+.EX
+capsule vpn curl -s https://ifconfig.me
+.EE
+.RE
+.
+.PP
+Use the network namespace of a running process:
+.PP
+.RS
+.EX
+capsule /proc/1234/ns/net ip route show
+.EE
+.RE
+.
+.PP
+List all named namespaces:
+.PP
+.RS
+.EX
+capsule list
+.EE
+.RE
+.
+.PP
+List namespaces with their running processes:
+.PP
+.RS
+.EX
+capsule list -v
+.EE
+.RE
+.
+.PP
+Show interfaces and processes for a namespace:
+.PP
+.RS
+.EX
+capsule status vpn
+.EE
+.RE
+.
+.PP
+Use a full path with status:
+.PP
+.RS
+.EX
+capsule status /proc/$$/ns/net
+.EE
+.RE
+.
+.SH SEE ALSO
+.BR ip-netns (8),
+.BR nsenter (1),
+.BR setns (2),
+.BR setcap (8),
+.BR getcap (8),
+.BR cap_set_proc (3),
+.BR capabilities (7),
+.BR network_namespaces (7)
+.
+.SH AUTHOR
+Written as a minimal capability-based namespace executor.
+.
+.SH CAVEATS
+.IP \(bu 2
+Only the network namespace is changed.  The mount, PID, UTS, IPC, and user
+namespaces remain those of the calling process.
+.IP \(bu
+The child may lack capabilities it expects
+.RB ( cap_net_raw ", " cap_net_bind_service ,
+etc.).  Grant those via a separate
+.BR setcap (8)
+on the child binary if needed.
+.IP \(bu
+.B PR_CAP_AMBIENT_CLEAR_ALL
+requires Linux\~4.3.  On older kernels the call is silently ignored.

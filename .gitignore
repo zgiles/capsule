@@ -1,0 +1,14 @@
+# build output
+capsule
+build/
+
+# packages
+*.deb
+*.rpm
+
+# editor / OS
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store

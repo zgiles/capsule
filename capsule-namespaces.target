@@ -1,0 +1,15 @@
+[Unit]
+Description=capsule VPN network namespaces
+Documentation=man:capsule(1)
+# Individual capsule-netns@<name>.service instances are pulled in through
+# this target by the capsule-netns-generator, which creates wants-symlinks
+# for every /etc/capsule/<name>.conf file it finds.
+#
+# Enable this target once to have all configured namespaces start at boot:
+#   systemctl enable capsule-namespaces.target
+#
+# Then drop configs into /etc/capsule/ and run:
+#   systemctl daemon-reload && systemctl start capsule-netns@<name>
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# capsule-netns-down — tear down a network namespace created by capsule-netns-up
+#
+# Usage: capsule-netns-down <nsname>
+#
+# Deleting the namespace destroys all interfaces inside it (including wg0),
+# terminating all WireGuard sessions cleanly.
+
+set -euo pipefail
+
+PROG=$(basename "$0")
+
+usage() { printf 'usage: %s <nsname>\n' "$PROG" >&2; exit 1; }
+die()   { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+log()   { printf '%s: %s\n' "$PROG" "$*"; }
+
+[[ $# -eq 1 ]] || usage
+
+NSNAME="$1"
+
+[[ $EUID -eq 0 ]] || die "must be run as root"
+
+# ── idempotency ───────────────────────────────────────────────────────────────
+
+if [[ ! -e "/var/run/netns/$NSNAME" ]]; then
+    log "namespace '$NSNAME' does not exist, nothing to do"
+    exit 0
+fi
+
+# ── teardown ──────────────────────────────────────────────────────────────────
+
+log "tearing down namespace '$NSNAME'"
+
+# Deleting the namespace removes all interfaces inside it.  There is no need
+# to bring down wg0 or delete it explicitly.
+ip netns delete "$NSNAME"
+
+# Remove the namespace-specific resolv.conf written by capsule-netns-up.
+if [[ -f "/etc/netns/$NSNAME/resolv.conf" ]]; then
+    rm -f "/etc/netns/$NSNAME/resolv.conf"
+    rmdir "/etc/netns/$NSNAME" 2>/dev/null || true
+fi
+
+log "namespace '$NSNAME' is down"

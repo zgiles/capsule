@@ -1,0 +1,33 @@
+[Unit]
+Description=capsule WireGuard network namespace: %i
+Documentation=man:capsule(1)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# WireGuard config for instance %i must exist at /etc/capsule/%i.conf
+# and be readable only by root (mode 600).
+ExecStart=/usr/local/bin/capsule-netns-up   %i /etc/capsule/%i.conf
+ExecStop=/usr/local/bin/capsule-netns-down  %i
+
+# The scripts require root to create namespaces and run ip/wg.
+User=root
+
+# Harden the service: it only needs network admin and sys_admin privileges.
+# All other capabilities are dropped.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/etc/netns /run/netns
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+# Pulled in through capsule-namespaces.target, which is itself
+# WantedBy=multi-user.target.  Enable that target once; individual
+# instances are then managed by the capsule-netns-generator.
+WantedBy=capsule-namespaces.target
