@@ -155,7 +155,7 @@ in {
 
     security.wrappers.capsule = {
       source       = "${pkgs.capsule}/bin/capsule";
-      capabilities = "cap_sys_admin,cap_dac_read_search+ep";
+      capabilities = "cap_sys_admin,cap_dac_read_search,cap_setpcap+ep";
       owner        = "root";
       group        = "root";
     };

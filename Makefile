@@ -47,7 +47,7 @@ $(TARGET): $(SRCS)
 # Run as root or with cap_setfcap:  sudo make setcap
 # Then test without installing:     ./capsule /var/run/netns/vpn <cmd>
 setcap: $(TARGET)
-	setcap 'cap_sys_admin,cap_dac_read_search+ep' ./$(TARGET)
+	setcap 'cap_sys_admin,cap_dac_read_search,cap_setpcap+ep' ./$(TARGET)
 	@echo "cap_sys_admin+ep set on ./$(TARGET)"
 
 install: $(TARGET)
@@ -60,7 +60,7 @@ install: $(TARGET)
 	install -D -m 0755 capsule-netns-generator        $(DESTDIR)$(GENERATORDIR)/capsule-netns-generator
 	install -d -m 0750 $(DESTDIR)$(NETNSCONF)
 ifeq ($(DESTDIR),)
-	setcap 'cap_sys_admin,cap_dac_read_search+ep' $(BINDIR)/$(TARGET)
+	setcap 'cap_sys_admin,cap_dac_read_search,cap_setpcap+ep' $(BINDIR)/$(TARGET)
 	systemctl daemon-reload
 endif
 
@@ -106,7 +106,7 @@ deb: $(TARGET)
 	  printf '#!/bin/sh\nset -e\n'; \
 	  printf 'case "$$1" in\n'; \
 	  printf '    configure)\n'; \
-	  printf '        setcap 'cap_sys_admin,cap_dac_read_search+ep' /usr/local/bin/capsule\n'; \
+	  printf '        setcap 'cap_sys_admin,cap_dac_read_search,cap_setpcap+ep' /usr/local/bin/capsule\n'; \
 	  printf '        systemctl daemon-reload || true\n'; \
 	  printf '        ;;\n'; \
 	  printf 'esac\n'; \

@@ -1,13 +1,15 @@
 /*
  * capsule — enter a network namespace and exec a command, then drop all caps.
  *
- * Install with:  setcap 'cap_sys_admin,cap_dac_read_search+ep' /usr/local/bin/capsule
+ * Install with:  setcap 'cap_sys_admin,cap_dac_read_search,cap_setpcap+ep' /usr/local/bin/capsule
  *
- * The binary is NOT setuid.  It acquires two capabilities via file caps:
+ * The binary is NOT setuid.  It acquires three capabilities via file caps:
  *   cap_dac_read_search — open the mode-000 namespace file (nsfs inodes
  *                         do not support setattr, so chmod is not possible)
  *   cap_sys_admin       — call setns(2) to enter the network namespace
- * Both are dropped before exec so the child runs fully unprivileged.
+ *   cap_setpcap         — drop cap_sys_admin, cap_dac_read_search, and
+ *                         cap_setpcap itself from the bounding set before exec
+ * All three are dropped before exec so the child runs fully unprivileged.
  */
 
 #include <dirent.h>
@@ -47,6 +49,25 @@ die(const char *msg)
     exit(1);
 }
 
+/* -------------------------------------------------------------- drop_all_caps */
+
+/*
+ * Clear the effective, permitted, and inheritable capability sets.
+ * Called by list/status paths after their privileged work is done, and by
+ * the exec path just before execvp.  Does NOT clear the ambient set — callers
+ * that exec must do that separately with PR_CAP_AMBIENT_CLEAR_ALL.
+ */
+static void
+drop_all_caps(void)
+{
+    cap_t empty = cap_init();
+    if (!empty)
+        die_errno("cap_init");
+    if (cap_set_proc(empty) < 0)
+        die_errno("cap_set_proc");
+    cap_free(empty);
+}
+
 /* ---------------------------------------------------------------- open_netns */
 
 /*
@@ -69,7 +90,10 @@ open_netns(const char *arg, char *resolved, size_t rsz)
     if (n <= 0 || n >= (int)rsz)
         die("namespace path too long");
 
-    int fd = open(resolved, O_RDONLY | O_CLOEXEC);
+    /* O_PATH: we only need an fd to identify the namespace for setns(2) and
+     * fstatfs(2); no read access is required or granted.  Requires Linux ≥ 3.12
+     * for fstatfs on O_PATH fds (capsule already requires Linux ≥ 3.19). */
+    int fd = open(resolved, O_PATH | O_CLOEXEC);
     if (fd < 0)
         die_errno(resolved);
 
@@ -158,7 +182,7 @@ list_procs(ino_t ns_ino, dev_t ns_dev)
 static void
 list_ifaces(int nsfd)
 {
-    int orig = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
+    int orig = open("/proc/self/ns/net", O_PATH | O_CLOEXEC);
     if (orig < 0)
         die_errno("open /proc/self/ns/net");
 
@@ -194,6 +218,9 @@ list_ifaces(int nsfd)
 static int
 cmd_list(int argc, char *argv[])
 {
+    /* list needs no elevated capabilities; drop them all before doing anything. */
+    drop_all_caps();
+
     int verbose = 0;
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--details") == 0)
@@ -254,6 +281,20 @@ cmd_status(int argc, char *argv[])
     char resolved[PATH_MAX];
     int nsfd = open_netns(name, resolved, sizeof(resolved));
 
+    /* Drop cap_dac_read_search immediately after opening the namespace file —
+     * same as the exec path.  list_ifaces only needs cap_sys_admin (for setns). */
+    {
+        cap_t caps = cap_get_proc();
+        if (!caps)
+            die_errno("cap_get_proc");
+        cap_value_t drop_dac[] = { CAP_DAC_READ_SEARCH };
+        if (cap_set_flag(caps, CAP_EFFECTIVE, 1, drop_dac, CAP_CLEAR) < 0 ||
+            cap_set_flag(caps, CAP_PERMITTED, 1, drop_dac, CAP_CLEAR) < 0 ||
+            cap_set_proc(caps) < 0)
+            die_errno("cap_set_proc: failed to drop cap_dac_read_search");
+        cap_free(caps);
+    }
+
     struct stat st;
     if (fstat(nsfd, &st) < 0)
         die_errno("fstat on namespace fd");
@@ -261,6 +302,8 @@ cmd_status(int argc, char *argv[])
     printf("Namespace: %s (%s)\n\n", name, resolved);
     printf("Interfaces:\n");
     list_ifaces(nsfd);
+    /* cap_sys_admin no longer needed. */
+    drop_all_caps();
     printf("\nProcesses:\n");
     list_procs(st.st_ino, st.st_dev);
     printf("\n");
@@ -327,6 +370,21 @@ main(int argc, char *argv[])
                                        sizeof(netns_resolved));
     const char *netns_path = netns_resolved;
 
+    /* Drop cap_dac_read_search immediately — only needed to open the namespace
+     * file above.  The remaining steps (unshare, mount, setns) need only
+     * cap_sys_admin; cap_setpcap is needed later for bounding-set drops. */
+    {
+        cap_t caps = cap_get_proc();
+        if (!caps)
+            die_errno("cap_get_proc");
+        cap_value_t drop_dac[] = { CAP_DAC_READ_SEARCH };
+        if (cap_set_flag(caps, CAP_EFFECTIVE, 1, drop_dac, CAP_CLEAR) < 0 ||
+            cap_set_flag(caps, CAP_PERMITTED, 1, drop_dac, CAP_CLEAR) < 0 ||
+            cap_set_proc(caps) < 0)
+            die_errno("cap_set_proc: failed to drop cap_dac_read_search");
+        cap_free(caps);
+    }
+
     /* ----------------------------------------------------------------
      * Set up DNS isolation via a private mount namespace.
      *
@@ -341,7 +399,7 @@ main(int argc, char *argv[])
      *
      * Steps:
      *   1. unshare(CLONE_NEWNS)  — private copy of the mount namespace.
-     *   2. MS_SLAVE|MS_REC on /  — our bind-mount won't propagate back.
+     *   2. MS_PRIVATE|MS_REC on / — fully isolated, no propagation either way.
      *   3. MS_BIND the resolv.conf into place.
      * ---------------------------------------------------------------- */
     {
@@ -349,22 +407,31 @@ main(int argc, char *argv[])
         const char *nsname = strrchr(netns_path, '/');
         nsname = nsname ? nsname + 1 : netns_path;
 
+        /* Only look up /etc/netns/<name>/resolv.conf for a simple, non-empty
+         * basename with no path separators and not '.' or '..'.  A crafted
+         * full path (e.g. /proc/<pid>/ns/net) can yield an unusual basename;
+         * skip the bind-mount rather than risk targeting an unexpected path. */
         char resolv_src[PATH_MAX];
-        int  resolv_len = snprintf(resolv_src, sizeof(resolv_src),
-                                   "/etc/netns/%s/resolv.conf", nsname);
-
-        struct stat st;
-        int have_resolv = (resolv_len > 0 &&
+        int  have_resolv = 0;
+        if (nsname[0] != '\0' &&
+            strcmp(nsname, ".")  != 0 &&
+            strcmp(nsname, "..") != 0 &&
+            strchr(nsname, '/') == NULL) {
+            int resolv_len = snprintf(resolv_src, sizeof(resolv_src),
+                                      "/etc/netns/%s/resolv.conf", nsname);
+            struct stat st;
+            have_resolv = (resolv_len > 0 &&
                            resolv_len < (int)sizeof(resolv_src) &&
                            stat(resolv_src, &st) == 0);
+        }
 
         if (have_resolv) {
             if (unshare(CLONE_NEWNS) < 0)
                 die_errno("unshare(CLONE_NEWNS)");
 
-            /* Prevent our bind-mount propagating to the parent namespace. */
-            if (mount("none", "/", NULL, MS_REC | MS_SLAVE, NULL) < 0)
-                die_errno("mount --make-rslave /");
+            /* Fully isolate the mount namespace — no propagation either way. */
+            if (mount("none", "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0)
+                die_errno("mount --make-rprivate /");
 
             if (mount(resolv_src, "/etc/resolv.conf", NULL, MS_BIND, NULL) < 0)
                 die_errno("bind-mount /etc/resolv.conf");
@@ -383,50 +450,46 @@ main(int argc, char *argv[])
     close(nsfd);
 
     /* ----------------------------------------------------------------
-     * Drop every capability.
+     * Drop capsule's file capabilities from the bounding set.
      *
-     * cap_init() returns a capability state with all sets empty.
-     * cap_set_proc() applies it to the calling thread, clearing the
-     * effective, permitted, and inheritable sets.
+     * prctl(PR_CAPBSET_DROP) requires CAP_SETPCAP in the caller's
+     * effective set, so this step MUST come before cap_set_proc()
+     * clears the effective set below.
      *
-     * We also clear the ambient set explicitly (requires Linux ≥ 4.3).
-     * Ambient caps can only be raised when both the inheritable and
-     * permitted sets contain the capability, so clearing those is
-     * already sufficient — but belt-and-suspenders never hurts.
-     * ---------------------------------------------------------------- */
-    cap_t empty = cap_init();
-    if (!empty)
-        die_errno("cap_init");
-
-    if (cap_set_proc(empty) < 0)
-        die_errno("cap_set_proc: failed to drop capabilities");
-
-    cap_free(empty);
-
-    /* Clear ambient capability set (best-effort; ignore EINVAL on old kernels). */
-    if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) < 0
-            && errno != EINVAL)
-        die_errno("prctl(PR_CAP_AMBIENT_CLEAR_ALL)");
-
-    /* ----------------------------------------------------------------
-     * Drop capsule's two file capabilities from the bounding set.
-     *
-     * Even though E/P/I are now empty, the bounding set still contains
-     * all capabilities by default.  Without this step, a child process
-     * that somehow gains a copy of the capsule binary (or another binary
-     * with the same file caps) could re-activate CAP_SYS_ADMIN or
-     * CAP_DAC_READ_SEARCH via the file capability mechanism and escape
-     * the network namespace.
-     *
-     * We drop only the two caps capsule uses; all others remain in the
-     * bounding set so that tools inside the child (sudo, ping, etc.)
+     * We drop the three caps that appear in capsule's file capability
+     * set (sys_admin, dac_read_search, setpcap).  All others remain in
+     * the bounding set so that tools inside the child (sudo, ping, etc.)
      * continue to work normally.
+     *
+     * Even though E/P/I will be empty after the next step, removing
+     * these from the bounding set closes the re-activation path: a
+     * child that executes a copy of capsule (or any binary carrying the
+     * same file caps) cannot re-acquire these capabilities and escape
+     * the network namespace.
      * ---------------------------------------------------------------- */
     if (prctl(PR_CAPBSET_DROP, CAP_SYS_ADMIN, 0, 0, 0) < 0)
         die_errno("prctl(PR_CAPBSET_DROP, CAP_SYS_ADMIN)");
 
     if (prctl(PR_CAPBSET_DROP, CAP_DAC_READ_SEARCH, 0, 0, 0) < 0)
         die_errno("prctl(PR_CAPBSET_DROP, CAP_DAC_READ_SEARCH)");
+
+    if (prctl(PR_CAPBSET_DROP, CAP_SETPCAP, 0, 0, 0) < 0)
+        die_errno("prctl(PR_CAPBSET_DROP, CAP_SETPCAP)");
+
+    /* ----------------------------------------------------------------
+     * Drop every capability (E/P/I), then clear the ambient set.
+     *
+     * Ambient caps can only be raised when both the inheritable and
+     * permitted sets contain the capability, so clearing those above is
+     * already sufficient — but belt-and-suspenders never hurts.
+     * Requires Linux ≥ 4.3; EINVAL on older kernels is ignored.
+     * ---------------------------------------------------------------- */
+    drop_all_caps();
+
+    /* Clear ambient capability set (best-effort; ignore EINVAL on old kernels). */
+    if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) < 0
+            && errno != EINVAL)
+        die_errno("prctl(PR_CAP_AMBIENT_CLEAR_ALL)");
 
     /* ----------------------------------------------------------------
      * Exec the requested command.

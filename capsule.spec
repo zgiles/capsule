@@ -22,13 +22,15 @@ Requires(post): systemd
 
 %description
 capsule allows an unprivileged user to execute a program inside a
-pre-existing Linux network namespace, without sudo, by using a binary
-installed with the cap_sys_admin file capability.
+pre-existing Linux network namespace, without sudo, using a binary
+installed with cap_sys_admin, cap_dac_read_search, and cap_setpcap
+file capabilities.
 
-The binary uses setns(2) to enter the network namespace, then immediately
-drops all capabilities via libcap before exec, so the child process runs
-fully unprivileged with the original caller's UID/GID and the unmodified
-environment.
+Each capability is scoped to the minimum necessary operation.
+cap_dac_read_search is dropped immediately after opening the namespace
+file. cap_setpcap is used only to remove all three capabilities from the
+bounding set before exec. The child process runs fully unprivileged with
+the original caller's UID/GID and unmodified environment.
 
 
 %prep
@@ -44,7 +46,7 @@ make install DESTDIR=%{buildroot} PREFIX=/usr
 
 
 %post
-setcap 'cap_sys_admin,cap_dac_read_search+ep' %{_bindir}/capsule
+setcap 'cap_sys_admin,cap_dac_read_search,cap_setpcap+ep' %{_bindir}/capsule
 %systemd_post capsule-netns@.service
 
 
