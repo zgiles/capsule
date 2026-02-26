@@ -90,6 +90,82 @@ sudo make uninstall
 
 ---
 
+## Nix / NixOS
+
+### Using the flake
+
+Add capsule to your flake inputs and import the module:
+
+```nix
+# flake.nix
+{
+  inputs.capsule.url = "github:zgiles/capsule";
+
+  outputs = { self, nixpkgs, capsule }: {
+    nixosConfigurations.mymachine = nixpkgs.lib.nixosSystem {
+      modules = [
+        capsule.nixosModules.default
+        ./configuration.nix
+      ];
+    };
+  };
+}
+```
+
+### NixOS module configuration
+
+```nix
+# configuration.nix
+{
+  programs.capsule = {
+    enable = true;
+
+    namespaces.myvpn = {
+      wireguard = {
+        privateKeyFile = "/run/secrets/myvpn-wg-key";  # agenix / sops-nix / manual
+        address        = "10.0.0.2/24";
+        dns            = "10.0.0.1";
+        peers = [{
+          publicKey  = "server-public-key=";
+          endpoint   = "vpn.example.com:51820";
+          allowedIPs = [ "0.0.0.0/0" "::/0" ];
+        }];
+      };
+      bindServices = [ "transmission.service" ];
+    };
+  };
+}
+```
+
+`bindServices` automatically injects into each listed service:
+
+- `NetworkNamespacePath = /var/run/netns/myvpn` — runs the service inside the VPN namespace
+- `After = capsule-netns-myvpn.service` — ensures the namespace is ready before the service starts
+- `Requires = capsule-netns-myvpn.service` — stops the service if the namespace goes down
+
+**`privateKeyFile`** is read at service start by the `ExecStartPre` script; the private key
+never enters the Nix store.  It is compatible with
+[agenix](https://github.com/ryantm/agenix),
+[sops-nix](https://github.com/Mic92/sops-nix),
+and manual key placement.
+
+The `enable` block installs the binary via `security.wrappers` with
+`cap_sys_admin,cap_dac_read_search+ep`, so no manual `setcap` is needed on NixOS.
+
+### Non-NixOS: nix profile install
+
+```bash
+nix profile install github:zgiles/capsule
+# Then grant capabilities manually (requires root or cap_setfcap):
+sudo setcap 'cap_sys_admin,cap_dac_read_search+ep' \
+    ~/.nix-profile/bin/capsule
+```
+
+Note: nix profile installations do not use `security.wrappers`, so you must
+run `setcap` manually after install and after each upgrade.
+
+---
+
 ## Setting up a WireGuard network namespace
 
 This is the canonical use-case: route specific applications through a VPN
