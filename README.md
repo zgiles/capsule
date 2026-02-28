@@ -12,7 +12,7 @@ capsule vpn firefox
 
 ## How it works
 
-1. Opens the namespace file with `O_PATH | O_CLOEXEC` and verifies it is a network namespace via `fstatfs` / `NSFS_MAGIC`. Drops `cap_dac_read_search` from E and P immediately — it is held only for this single `open` call.
+1. Opens the namespace file with `O_RDONLY | O_CLOEXEC` and verifies it is a network namespace via `fstatfs` / `NSFS_MAGIC`. Drops `cap_dac_read_search` from E and P immediately — it is held only for this single `open` call.
 2. If `/etc/netns/<name>/resolv.conf` exists, and `<name>` is a simple non-empty basename (not `.`, `..`, or containing `/`), creates a fully private mount namespace (`MS_PRIVATE`) and bind-mounts the file over `/etc/resolv.conf` for DNS isolation.
 3. Calls `setns(CLONE_NEWNET)` to enter the network namespace.
 4. Drops `cap_sys_admin`, `cap_dac_read_search`, and `cap_setpcap` from the capability bounding set via `prctl(PR_CAPBSET_DROP)` — before the E/P/I clear, because `PR_CAPBSET_DROP` requires `cap_setpcap` in the effective set.
@@ -31,7 +31,7 @@ capsule is installed `setcap 'cap_sys_admin,cap_dac_read_search,cap_setpcap+ep'`
 |---|---|
 | File capabilities | `cap_sys_admin`, `cap_dac_read_search`, `cap_setpcap` in E+P only |
 | `cap_dac_read_search` scope | Dropped from E+P immediately after the namespace `open` call |
-| Namespace fd | `O_PATH` — no read access through the fd; sufficient for `fstatfs` and `setns` |
+| Namespace fd | `O_RDONLY | O_CLOEXEC` — `setns(2)` requires a real open; `cap_dac_read_search` covers mode-000 nsfs files |
 | Bounding set | `cap_sys_admin`, `cap_dac_read_search`, `cap_setpcap` removed before exec |
 | Child capabilities | None — E, P, I, ambient all empty; bounding set reduced |
 | `list` / `status` paths | Drop all capabilities before unprivileged work |
@@ -57,7 +57,7 @@ A child executing any binary with the same file capabilities cannot re-acquire `
 
 ## Requirements
 
-- Linux 3.19+ (`NSFS_MAGIC` namespace verification; `O_PATH` + `fstatfs` requires 3.12)
+- Linux 3.19+ (`NSFS_MAGIC` namespace verification)
 - Linux 4.3+ for ambient capability clearing (silently skipped on older kernels)
 - `libcap` development headers (`libcap-dev` / `libcap-devel`)
 - `libcap2-bin` (provides `setcap`) for non-Nix installation

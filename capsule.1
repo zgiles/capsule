@@ -36,11 +36,15 @@ Verify the caller is not root (UID\~0).
 Open
 .I netns
 with
-.B O_PATH
-(no read access through the fd) and verify via
+.B O_RDONLY | O_CLOEXEC
+and verify via
 .BR fstatfs (2)
 that it is a network namespace
 .RB ( NSFS_MAGIC ).
+.RB ( setns (2)
+requires a real open fd;
+.B cap_dac_read_search
+covers mode-000 nsfs files.)
 Drop
 .B cap_dac_read_search
 from the effective and permitted sets immediately after.
@@ -303,17 +307,17 @@ capabilities after interface enumeration completes, before process listing.
 .
 .SS Namespace fd
 The namespace file is opened with
-.B O_PATH | O_CLOEXEC
-rather than
-.BR O_RDONLY .
-.B O_PATH
-provides a file descriptor identifying the file without granting read access.
-.BR fstatfs (2)
-(since Linux\~3.12) and
+.BR O_RDONLY | O_CLOEXEC .
 .BR setns (2)
-both accept
+requires a real open file descriptor; it rejects
 .B O_PATH
-file descriptors.
+fds because the kernel verifies that the fd carries
+.B ns_file_operations
+(replaced by a stub for
+.B O_PATH
+descriptors).
+.B cap_dac_read_search
+allows opening mode-000 nsfs files and is dropped immediately after the open.
 .
 .SS Input validation
 The namespace basename used to locate

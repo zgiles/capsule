@@ -90,10 +90,11 @@ open_netns(const char *arg, char *resolved, size_t rsz)
     if (n <= 0 || n >= (int)rsz)
         die("namespace path too long");
 
-    /* O_PATH: we only need an fd to identify the namespace for setns(2) and
-     * fstatfs(2); no read access is required or granted.  Requires Linux ≥ 3.12
-     * for fstatfs on O_PATH fds (capsule already requires Linux ≥ 3.19). */
-    int fd = open(resolved, O_PATH | O_CLOEXEC);
+    /* O_RDONLY: setns(2) requires a real open fd — O_PATH fds are rejected with
+     * EBADF because the kernel checks that the fd has ns_file_operations, which
+     * are replaced by a stub for O_PATH.  cap_dac_read_search is held at this
+     * point specifically to open mode-000 nsfs files. */
+    int fd = open(resolved, O_RDONLY | O_CLOEXEC);
     if (fd < 0)
         die_errno(resolved);
 
@@ -182,7 +183,7 @@ list_procs(ino_t ns_ino, dev_t ns_dev)
 static void
 list_ifaces(int nsfd)
 {
-    int orig = open("/proc/self/ns/net", O_PATH | O_CLOEXEC);
+    int orig = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
     if (orig < 0)
         die_errno("open /proc/self/ns/net");
 
