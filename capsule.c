@@ -318,10 +318,11 @@ cmd_status(int argc, char *argv[])
 static void __attribute__((noreturn))
 usage(void)
 {
-    fputs("usage: capsule <netns> <command> [args...]\n"
+    fputs("usage: capsule [-H hostname] <netns> <command> [args...]\n"
           "       capsule list [-v]\n"
           "       capsule status [-v] <netns>\n"
           "\n"
+          "  -H hostname  unshare UTS namespace and set hostname\n"
           "  netns    namespace name (looks up /var/run/netns/<name>)\n"
           "           or full path (/var/run/netns/vpn, /proc/<pid>/ns/net)\n"
           "  command  program to execute inside that namespace\n"
@@ -342,7 +343,29 @@ main(int argc, char *argv[])
         return cmd_list(argc, argv);
     if (argc >= 2 && strcmp(argv[1], "status") == 0)
         return cmd_status(argc, argv);
-    if (argc < 3)
+
+    /* ----------------------------------------------------------------
+     * Parse optional -H <hostname> flag.
+     *
+     * When present, capsule will unshare a new UTS namespace and set
+     * the hostname before exec, so the child sees an isolated hostname
+     * rather than the host's.  argi tracks the position of the netns
+     * argument after consuming any flags.
+     * ---------------------------------------------------------------- */
+    const char *uts_hostname = NULL;
+    int         argi         = 1;
+    if (argc > 1 && strcmp(argv[1], "-H") == 0) {
+        if (argc < 4)
+            usage();
+        uts_hostname = argv[2];
+        if (uts_hostname[0] == '\0')
+            die("-H: hostname must not be empty");
+        if (strlen(uts_hostname) > HOST_NAME_MAX)
+            die("-H: hostname too long");
+        argi = 3;
+    }
+
+    if (argc < argi + 2)
         usage();
 
     /* ----------------------------------------------------------------
@@ -356,7 +379,7 @@ main(int argc, char *argv[])
     if (getuid() == 0)
         die("refusing to run as root (UID 0)");
 
-    char      **cmd        = &argv[2];
+    char **cmd = &argv[argi + 1];
 
     /* ----------------------------------------------------------------
      * Resolve the netns argument and open the namespace file.
@@ -367,7 +390,7 @@ main(int argc, char *argv[])
      * all work as-is.
      * ---------------------------------------------------------------- */
     char        netns_resolved[PATH_MAX];
-    int         nsfd      = open_netns(argv[1], netns_resolved,
+    int         nsfd      = open_netns(argv[argi], netns_resolved,
                                        sizeof(netns_resolved));
     const char *netns_path = netns_resolved;
 
@@ -437,6 +460,20 @@ main(int argc, char *argv[])
             if (mount(resolv_src, "/etc/resolv.conf", NULL, MS_BIND, NULL) < 0)
                 die_errno("bind-mount /etc/resolv.conf");
         }
+    }
+
+    /* ----------------------------------------------------------------
+     * UTS namespace isolation (-H flag).
+     *
+     * Unshare a new UTS namespace and set the requested hostname so
+     * the child process cannot observe or leak the host's real hostname.
+     * cap_sys_admin is required for unshare(CLONE_NEWUTS).
+     * ---------------------------------------------------------------- */
+    if (uts_hostname != NULL) {
+        if (unshare(CLONE_NEWUTS) < 0)
+            die_errno("unshare(CLONE_NEWUTS)");
+        if (sethostname(uts_hostname, strlen(uts_hostname)) < 0)
+            die_errno("sethostname");
     }
 
     /* ----------------------------------------------------------------

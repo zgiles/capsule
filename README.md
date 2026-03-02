@@ -14,10 +14,11 @@ capsule vpn firefox
 
 1. Opens the namespace file with `O_RDONLY | O_CLOEXEC` and verifies it is a network namespace via `fstatfs` / `NSFS_MAGIC`. Drops `cap_dac_read_search` from E and P immediately — it is held only for this single `open` call.
 2. If `/etc/netns/<name>/resolv.conf` exists, and `<name>` is a simple non-empty basename (not `.`, `..`, or containing `/`), creates a fully private mount namespace (`MS_PRIVATE`) and bind-mounts the file over `/etc/resolv.conf` for DNS isolation.
-3. Calls `setns(CLONE_NEWNET)` to enter the network namespace.
-4. Drops `cap_sys_admin`, `cap_dac_read_search`, and `cap_setpcap` from the capability bounding set via `prctl(PR_CAPBSET_DROP)` — before the E/P/I clear, because `PR_CAPBSET_DROP` requires `cap_setpcap` in the effective set.
-5. Clears all capabilities: effective, permitted, inheritable, and ambient.
-6. `execvp`s the command with the original UID/GID and unmodified environment.
+3. If `-H hostname` is given, calls `unshare(CLONE_NEWUTS)` and `sethostname(2)` to give the child an isolated hostname, preventing hostname leakage through network traffic.
+4. Calls `setns(CLONE_NEWNET)` to enter the network namespace.
+5. Drops `cap_sys_admin`, `cap_dac_read_search`, and `cap_setpcap` from the capability bounding set via `prctl(PR_CAPBSET_DROP)` — before the E/P/I clear, because `PR_CAPBSET_DROP` requires `cap_setpcap` in the effective set.
+6. Clears all capabilities: effective, permitted, inheritable, and ambient.
+7. `execvp`s the command with the original UID/GID and unmodified environment.
 
 `execvp` replaces the capsule process; the child's exit code propagates directly to the caller.
 
@@ -262,7 +263,7 @@ sudo capsule-netns-down myvpn
 ## Usage
 
 ```
-capsule <netns> <command> [args...]
+capsule [-H hostname] <netns> <command> [args...]
 capsule list [-v]
 capsule status [-v] <netns>
 ```
@@ -273,6 +274,7 @@ capsule /var/run/netns/vpn firefox         # explicit path
 capsule vpn bash                           # interactive shell for debugging
 capsule /proc/1234/ns/net ip route         # any process's network namespace
 capsule vpn curl -s https://ifconfig.me
+capsule -H vpn-host vpn firefox            # isolated hostname to prevent leakage
 ```
 
 ---

@@ -5,6 +5,8 @@ capsule \- execute a command inside a Linux network namespace
 .
 .SH SYNOPSIS
 .B capsule
+.RB [ \-H
+.IR hostname ]
 .I netns
 .I command
 .RI [ args \&.\|.\|.]
@@ -64,12 +66,23 @@ and bind-mount the file over
 .I /etc/resolv.conf
 for DNS isolation.
 .IP 4.
+If
+.B \-H
+.I hostname
+is given, call
+.BR unshare (2)
+with
+.B CLONE_NEWUTS
+to create a private UTS namespace and set the hostname via
+.BR sethostname (2).
+The child process cannot observe or leak the host's real hostname.
+.IP 5.
 Call
 .BR setns (2)
 with
 .B CLONE_NEWNET
 to enter the namespace.
-.IP 5.
+.IP 6.
 Drop
 .BR cap_sys_admin ,
 .BR cap_dac_read_search ,
@@ -82,9 +95,9 @@ from the capability bounding set via
 requires
 .B cap_setpcap
 in the effective set, so this precedes the capability clear below.)
-.IP 6.
-Clear all capabilities: effective, permitted, inheritable, and ambient.
 .IP 7.
+Clear all capabilities: effective, permitted, inheritable, and ambient.
+.IP 8.
 .BR execvp (3)
 the requested command with the original UID/GID and unmodified environment.
 .PP
@@ -117,6 +130,17 @@ call in interface enumeration completes.
 is accepted and reserved; status always shows full detail.
 .
 .SH OPTIONS
+.TP
+.BI \-H " hostname"
+Create a new UTS namespace and set its hostname to
+.IR hostname .
+Prevents the child process from observing or leaking the host's real
+hostname through any network traffic or system call.
+.I hostname
+must be non-empty and no longer than
+.B HOST_NAME_MAX
+(64) characters.
+.
 .TP
 .I netns
 Either a short namespace name or a full path.
@@ -441,12 +465,19 @@ capsule status vpn
 .
 .SH CAVEATS
 .IP \(bu 2
-Only the network namespace is changed.
-The mount, PID, UTS, IPC, and user namespaces remain those of the calling process.
-(When DNS isolation is active, a private mount namespace is also created,
-but only to perform the
-.I /etc/resolv.conf
-bind-mount.)
+Only the network namespace is changed by default.
+The PID, IPC, and user namespaces always remain those of the calling process.
+A private mount namespace is created when DNS isolation is active (resolv.conf
+bind-mount only).
+A private UTS namespace is created when
+.B \-H
+is given.
+.IP \(bu
+.B \-H
+isolates the hostname and domainname only.
+The kernel version, machine type, and other
+.BR uname (2)
+fields are not affected and remain visible to the child.
 .IP \(bu
 The child starts with no capabilities.
 Tools that require file capabilities
